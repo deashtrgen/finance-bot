@@ -95,6 +95,16 @@ def cell_int(val) -> int:
         return 0
 
 
+def _parse_sub_note(note: str) -> tuple[str, str]:
+    """Parse 'Group | Name' or 'Name' — returns (group, name). Defaults to 'Other'/'Unnamed'."""
+    if not note:
+        return ("Other", "Unnamed")
+    if "|" in note:
+        parts = [p.strip() for p in note.split("|", 1)]
+        return (parts[0] or "Other", parts[1] or "Unnamed")
+    return ("Other", note.strip() or "Unnamed")
+
+
 # ── Telegram Mini App auth ────────────────────────────────────────────────────
 # Docs: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 def verify_init_data(init_data: str) -> dict:
@@ -155,6 +165,8 @@ class EmergencyFundIn(BaseModel):
 class ExpenseIn(BaseModel):
     category: str
     amount: int
+    sub_group: str | None = None   # only used when category == "Subscriptions"
+    sub_name:  str | None = None
 
 class IncomeIn(BaseModel):
     source: str
@@ -310,12 +322,23 @@ async def api_summary(user: dict = Depends(auth)):
         # Expenses
         expense_total = 0
         by_cat = defaultdict(int)
+        # Subscriptions breakdown (from Note column: "Group | Name")
+        subs_by_group = defaultdict(int)
+        subs_by_name  = defaultdict(int)
+        subs_total    = 0
         try:
             ws = book.worksheet(SHEET_BUDGET)
             for r in ws.get_all_values()[1:]:
                 if len(r) >= 3 and r[0].startswith(month):
-                    by_cat[r[1]] += cell_int(r[2])
-                    expense_total += cell_int(r[2])
+                    amt = cell_int(r[2])
+                    by_cat[r[1]] += amt
+                    expense_total += amt
+                    if r[1] == "Subscriptions":
+                        subs_total += amt
+                        note = r[3] if len(r) >= 4 else ""
+                        group, name = _parse_sub_note(note)
+                        subs_by_group[group] += amt
+                        subs_by_name[name]   += amt
         except: pass
 
         # EF
@@ -351,6 +374,9 @@ async def api_summary(user: dict = Depends(auth)):
             "expense_month": expense_total,
             "net_month": income_total - expense_total,
             "expenses_by_category": dict(sorted(by_cat.items(), key=lambda x: -x[1])),
+            "subs_total":    subs_total,
+            "subs_by_group": dict(sorted(subs_by_group.items(), key=lambda x: -x[1])),
+            "subs_by_name":  dict(sorted(subs_by_name.items(),  key=lambda x: -x[1])),
             "ef_total": ef_total,
             "ef_target": EF_TARGET,
             "ef_pct": min(round(ef_total / EF_TARGET * 100, 1), 100) if EF_TARGET else 0,
@@ -405,9 +431,21 @@ async def api_ef_add(payload: EmergencyFundIn, user: dict = Depends(auth)):
 async def api_expense_add(payload: ExpenseIn, user: dict = Depends(auth)):
     if payload.amount <= 0:
         raise HTTPException(400, "amount must be positive")
+
+    note = ""
+    if payload.category == "Subscriptions":
+        group = (payload.sub_group or "").strip()
+        name  = (payload.sub_name  or "").strip()
+        if group and name:
+            note = f"{group} | {name}"
+        elif name:
+            note = name
+        elif group:
+            note = group
+
     def _save():
         ws = get_sheet().worksheet(SHEET_BUDGET)
-        ws.append_row([datetime.now().strftime("%Y-%m-%d"), payload.category, payload.amount, ""])
+        ws.append_row([datetime.now().strftime("%Y-%m-%d"), payload.category, payload.amount, note])
         return {"ok": True}
     return await run_sync(_save)
 
