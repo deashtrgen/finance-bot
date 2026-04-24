@@ -11,6 +11,11 @@ if (tg) {
 const initData = tg?.initData || "";
 const fmt = (n) => "₸" + Number(n || 0).toLocaleString("en-US").replace(/,/g, " ");
 
+// Show logout button only in browser (not inside Telegram Mini App)
+if (!initData) {
+  document.getElementById("logout-btn")?.classList.remove("hidden");
+}
+
 // ── API wrapper ────────────────────────────────────────────────
 async function api(path, options = {}) {
   const headers = {
@@ -18,7 +23,11 @@ async function api(path, options = {}) {
     "X-Telegram-Init-Data": initData,
     ...(options.headers || {}),
   };
-  const res = await fetch(path, { ...options, headers });
+  const res = await fetch(path, {
+    credentials: "include",   // include session cookie for browser auth
+    ...options,
+    headers,
+  });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try { detail = (await res.json()).detail || detail; } catch {}
@@ -69,11 +78,25 @@ let EF_TARGET = 2988000;
     document.getElementById("ef-target").textContent = fmt(EF_TARGET);
     await loadSummary();
   } catch (e) {
+    // If this is a browser (no Telegram WebApp context), redirect to login page.
+    // If inside Telegram, show the error directly — re-login via /login won't help there.
+    if (!initData) {
+      window.location.href = "/login";
+      return;
+    }
     document.getElementById("summary-loading").innerHTML =
-      '<div style="color:#E74C3C">Auth failed. Open this app from inside Telegram.</div>' +
+      '<div style="color:#E74C3C">Auth failed. Try closing and reopening the app.</div>' +
       `<div class="muted" style="margin-top:10px">${e.message}</div>`;
   }
 })();
+
+// Logout handler (browser only)
+async function logout() {
+  try {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+  } catch {}
+  window.location.href = "/login";
+}
 
 // ═══════════════════════════════════════════════════════════════
 // SUMMARY / HOME
@@ -276,6 +299,7 @@ async function loadChart(kind) {
   wrap.innerHTML = '<div class="muted center">Loading chart…</div>';
   try {
     const res = await fetch(`/api/charts/${kind}`, {
+      credentials: "include",
       headers: { "X-Telegram-Init-Data": initData },
     });
     if (!res.ok) {
@@ -359,242 +383,4 @@ async function deleteEntry(kind, row) {
     showToast("Deleted");
     loadEntries();
   } catch (e) { showToast(e.message, false); }
-}<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>Finance</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="/static/style.css" />
-</head>
-<body>
-
-<header id="topbar">
-  <div class="brand">💼 Finance</div>
-  <div class="user" id="userName">…</div>
-</header>
-
-<!-- ─── TABS ─────────────────────────────────────── -->
-<nav id="tabs">
-  <button data-tab="home"    class="tab active">📋 Home</button>
-  <button data-tab="income"  class="tab">💵 Income</button>
-  <button data-tab="expense" class="tab">📊 Expense</button>
-  <button data-tab="ef"      class="tab">💰 Emergency</button>
-  <button data-tab="account" class="tab">💳 Accounts</button>
-  <button data-tab="inv"     class="tab">📈 Investments</button>
-  <button data-tab="charts"  class="tab">📉 Charts</button>
-  <button data-tab="edit"    class="tab">✏️ Edit</button>
-</nav>
-
-<main id="app">
-
-  <!-- ═══════════════ HOME / SUMMARY ═══════════════ -->
-  <section id="panel-home" class="panel active">
-    <div id="summary-loading" class="muted center">Loading…</div>
-    <div id="summary-content" class="hidden">
-      <div class="card card-accent">
-        <div class="row"><span>Net Worth</span><strong id="s-networth">—</strong></div>
-      </div>
-
-      <div class="grid-2">
-        <div class="card">
-          <div class="label">Income — <span id="s-month">this month</span></div>
-          <div class="value" id="s-income">—</div>
-        </div>
-        <div class="card">
-          <div class="label">Expenses — this month</div>
-          <div class="value" id="s-expense">—</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="row"><span>Net this month</span><strong id="s-net">—</strong></div>
-      </div>
-
-      <div class="card">
-        <div class="label">💰 Emergency Fund</div>
-        <div class="progress"><div class="progress-bar" id="s-ef-bar"></div></div>
-        <div class="row subtle"><span id="s-ef-total">—</span><span id="s-ef-pct">—</span></div>
-      </div>
-
-      <div class="card">
-        <div class="label">💳 Bank Accounts</div>
-        <div class="value small" id="s-accounts-total">—</div>
-        <ul class="list" id="s-accounts"></ul>
-      </div>
-
-      <div class="card">
-        <div class="label">📈 Investments (latest)</div>
-        <div class="value small" id="s-inv-total">—</div>
-        <ul class="list" id="s-inv"></ul>
-      </div>
-
-      <div class="card">
-        <div class="label">📊 Top spending categories this month</div>
-        <ul class="list" id="s-exp-cats"></ul>
-      </div>
-
-      <div class="card hidden" id="s-subs-card">
-        <div class="row">
-          <div class="label" style="margin-bottom:0">📺 Subscriptions this month</div>
-          <strong id="s-subs-total">—</strong>
-        </div>
-        <div class="label" style="margin-top:10px">By group</div>
-        <ul class="list" id="s-subs-groups"></ul>
-        <div class="label" style="margin-top:10px">By subscription</div>
-        <ul class="list" id="s-subs-names"></ul>
-      </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════ INCOME ═══════════════ -->
-  <section id="panel-income" class="panel">
-    <h2>💵 Log Income</h2>
-    <label class="label">Source</label>
-    <select id="inc-source">
-      <option>Salary</option>
-      <option>Freelance / side income</option>
-      <option>Bonus</option>
-      <option>Investment income</option>
-      <option>Gift</option>
-      <option>Refund</option>
-      <option>Other</option>
-    </select>
-
-    <label class="label">Amount (₸)</label>
-    <input id="inc-amount" type="number" inputmode="numeric" min="0" placeholder="e.g. 1500000" />
-
-    <button class="primary" onclick="submitIncome()">Save income</button>
-    <div id="inc-msg" class="msg"></div>
-  </section>
-
-  <!-- ═══════════════ EXPENSE ═══════════════ -->
-  <section id="panel-expense" class="panel">
-    <h2>📊 Log Expense</h2>
-    <label class="label">Category</label>
-    <select id="exp-cat" onchange="toggleSubFields()">
-      <option>Rent / mortgage</option>
-      <option>Utilities</option>
-      <option>Internet & phone</option>
-      <option>Groceries</option>
-      <option>Cafes & restaurants</option>
-      <option>Car / transport</option>
-      <option>Taxi / public transport</option>
-      <option>Subscriptions</option>
-      <option>Health / gym</option>
-      <option>Clothing & care</option>
-      <option>Entertainment</option>
-      <option>Family / parents</option>
-      <option>Miscellaneous</option>
-    </select>
-
-    <div id="sub-fields" class="hidden">
-      <label class="label">Group</label>
-      <select id="sub-group">
-        <option>Streaming</option>
-        <option>Music</option>
-        <option>Productivity</option>
-        <option>Cloud storage</option>
-        <option>News / media</option>
-        <option>Gaming</option>
-        <option>AI tools</option>
-        <option>VPN / security</option>
-        <option>Fitness</option>
-        <option>Other</option>
-      </select>
-
-      <label class="label">Name</label>
-      <input id="sub-name" type="text" placeholder="e.g. Netflix, Spotify, ChatGPT" />
-    </div>
-
-    <label class="label">Amount (₸)</label>
-    <input id="exp-amount" type="number" inputmode="numeric" min="0" placeholder="e.g. 15000" />
-
-    <button class="primary" onclick="submitExpense()">Save expense</button>
-    <div id="exp-msg" class="msg"></div>
-  </section>
-
-  <!-- ═══════════════ EMERGENCY ═══════════════ -->
-  <section id="panel-ef" class="panel">
-    <h2>💰 Emergency Fund</h2>
-    <div class="card">
-      <div class="label">Target</div>
-      <div class="value" id="ef-target">—</div>
-    </div>
-
-    <label class="label">Amount saved this time (₸)</label>
-    <input id="ef-amount" type="number" inputmode="numeric" min="0" placeholder="e.g. 498000" />
-
-    <button class="primary" onclick="submitEF()">Log savings</button>
-    <div id="ef-msg" class="msg"></div>
-  </section>
-
-  <!-- ═══════════════ ACCOUNT ═══════════════ -->
-  <section id="panel-account" class="panel">
-    <h2>💳 Bank Account Balance</h2>
-
-    <label class="label">Account name</label>
-    <input id="acc-name" type="text" placeholder="e.g. Kaspi Gold" />
-
-    <label class="label">Current balance (₸)</label>
-    <input id="acc-balance" type="number" inputmode="numeric" min="0" placeholder="e.g. 1500000" />
-
-    <button class="primary" onclick="submitAccount()">Save balance snapshot</button>
-    <div id="acc-msg" class="msg"></div>
-  </section>
-
-  <!-- ═══════════════ INVESTMENTS ═══════════════ -->
-  <section id="panel-inv" class="panel">
-    <h2>📈 Investment Snapshot</h2>
-
-    <label class="label">Wallet / account</label>
-    <input id="inv-wallet" type="text" placeholder="e.g. Freedom Finance" />
-
-    <label class="label">Asset</label>
-    <input id="inv-asset" type="text" placeholder="e.g. US T-Bills ETF" />
-
-    <label class="label">Current value (₸)</label>
-    <input id="inv-value" type="number" inputmode="numeric" min="0" placeholder="e.g. 1500000" />
-
-    <button class="primary" onclick="submitInvestment()">Save snapshot</button>
-    <div id="inv-msg" class="msg"></div>
-  </section>
-
-  <!-- ═══════════════ CHARTS ═══════════════ -->
-  <section id="panel-charts" class="panel">
-    <h2>📉 Charts</h2>
-    <div class="chart-buttons">
-      <button onclick="loadChart('ef')">💰 Emergency fund growth</button>
-      <button onclick="loadChart('exp_cat')">📊 Expenses this month</button>
-      <button onclick="loadChart('inc_exp')">💵 Income vs Expenses</button>
-      <button onclick="loadChart('acc')">💳 Account balances</button>
-      <button onclick="loadChart('inv')">📈 Investment portfolio</button>
-    </div>
-    <div id="chart-wrap" class="chart-wrap"></div>
-  </section>
-
-  <!-- ═══════════════ EDIT ═══════════════ -->
-  <section id="panel-edit" class="panel">
-    <h2>✏️ Edit entries</h2>
-    <label class="label">Which log?</label>
-    <select id="edit-kind" onchange="loadEntries()">
-      <option value="">— choose —</option>
-      <option value="ef">💰 Emergency Fund</option>
-      <option value="exp">📊 Expenses</option>
-      <option value="inc">💵 Income</option>
-      <option value="acc">💳 Accounts</option>
-      <option value="inv">📈 Investments</option>
-    </select>
-
-    <div id="entries-list"></div>
-  </section>
-
-</main>
-
-<div id="toast" class="toast hidden"></div>
-
-<script src="/static/app.js"></script>
-
-</body>
-</html>
+}
