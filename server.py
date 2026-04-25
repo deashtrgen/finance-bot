@@ -85,11 +85,50 @@ def _check_rate_limit(bucket: str, ip: str) -> None:
 
 
 def _client_ip(request: Request) -> str:
-    # Railway sits behind a proxy; trust X-Forwarded-For first IP
+    # Railway sits behind exactly one proxy layer. The rightmost X-Forwarded-For
+    # entry is the IP added by the trusted proxy; left-side entries can be spoofed
+    # by clients sending their own X-Forwarded-For header.
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        return fwd.split(",")[0].strip()
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.client.host if request.client else "unknown"
+
+
+def _janitor_cleanup() -> None:
+    """Drop expired sessions and stale rate-limit entries."""
+    now = time.time()
+
+    # Prune expired sessions
+    expired_sessions = [sid for sid, s in SESSIONS.items() if s["expires_at"] < now]
+    for sid in expired_sessions:
+        SESSIONS.pop(sid, None)
+
+    # Prune empty rate-limit entries (windows fully expired)
+    stale_keys = []
+    for key, timestamps in _RATE_LIMIT.items():
+        # Largest window we have is 60s — anything older is dead weight
+        if not any(now - t < 60 for t in timestamps):
+            stale_keys.append(key)
+    for key in stale_keys:
+        _RATE_LIMIT.pop(key, None)
+
+    if expired_sessions or stale_keys:
+        logger.info(
+            f"Janitor: pruned {len(expired_sessions)} sessions, "
+            f"{len(stale_keys)} rate-limit buckets"
+        )
+
+
+async def _janitor_loop():
+    """Periodic background task — runs every 10 minutes."""
+    while True:
+        try:
+            _janitor_cleanup()
+        except Exception as e:
+            logger.warning(f"Janitor error: {e}")
+        await asyncio.sleep(600)
 
 if not all([BOT_TOKEN, SHEET_ID, CREDENTIALS]):
     raise RuntimeError("Missing required env vars: BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS")
@@ -238,13 +277,14 @@ def verify_login_widget(data: dict) -> dict:
     if not hmac.compare_digest(expected_hash, received_hash):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Check auth_date freshness (reject if older than 1 day)
+    # Check auth_date freshness — login payload should be VERY fresh (5 min max).
+    # Once authenticated, the 30-day session cookie takes over for sustained access.
     try:
         auth_date = int(data.get("auth_date", "0"))
     except (ValueError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid auth_date")
 
-    if time.time() - auth_date > 86400:
+    if time.time() - auth_date > 300:
         raise HTTPException(status_code=401, detail="Login data too old — please log in again")
 
     return data
@@ -280,14 +320,16 @@ class AccountIn(BaseModel):
     account: str = Field(min_length=1, max_length=80)
     balance: int = Field(gt=0, le=1_000_000_000)
 
+from typing import Literal
+
 class EditIn(BaseModel):
-    kind:       str = Field(min_length=1, max_length=10)
+    kind:       Literal["ef", "exp", "inc", "acc", "inv"]
     row:        int = Field(ge=2, le=10000)
     new_amount: int = Field(gt=0, le=1_000_000_000)
 
 
 class DeleteIn(BaseModel):
-    kind: str = Field(min_length=1, max_length=10)
+    kind: Literal["ef", "exp", "inc", "acc", "inv"]
     row:  int = Field(ge=2, le=10000)
 
 EDIT_SHEETS = {
@@ -296,6 +338,26 @@ EDIT_SHEETS = {
     "inc": (SHEET_INCOME,   2),
     "acc": (SHEET_ACCOUNTS, 2),
     "inv": (SHEET_INV,      3),
+}
+
+# Server-side whitelists — must match the frontend dropdowns
+EXPENSE_CATEGORIES = {
+    "Rent / mortgage", "Utilities", "Internet & phone",
+    "Groceries", "Cafes & restaurants",
+    "Car / transport", "Taxi / public transport",
+    "Subscriptions", "Health / gym", "Clothing & care",
+    "Entertainment", "Family / parents", "Miscellaneous",
+}
+
+INCOME_SOURCES = {
+    "Salary", "Freelance / side income", "Bonus",
+    "Investment income", "Gift", "Refund", "Other",
+}
+
+SUB_GROUPS = {
+    "Streaming", "Music", "Productivity", "Cloud storage",
+    "News / media", "Gaming", "AI tools", "VPN / security",
+    "Fitness", "Other",
 }
 
 
@@ -336,10 +398,19 @@ async def lifespan(app: FastAPI):
         logger.warning("WEBAPP_URL not set — users won't have an 'Open App' menu button.")
 
     logger.info("Bot started (polling).")
+
+    # Start the janitor background task
+    janitor_task = asyncio.create_task(_janitor_loop())
+
     try:
         yield
     finally:
-        logger.info("Shutting down bot...")
+        logger.info("Shutting down...")
+        janitor_task.cancel()
+        try:
+            await janitor_task
+        except asyncio.CancelledError:
+            pass
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
@@ -359,6 +430,27 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-Telegram-Init-Data"],
 )
+
+
+# ── Security headers middleware ─────────────────────────────────────────────
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Allow Telegram's webview to embed us (Mini App), but no other origin
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://telegram.org https://*.telegram.org; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: https:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; "
+        "form-action 'self'; "
+        "base-uri 'self'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
 
 
 # ── Bot handlers (minimal) ───────────────────────────────────────────────────
@@ -616,11 +708,15 @@ async def api_ef_add(payload: EmergencyFundIn, user: dict = Depends(auth)):
 async def api_expense_add(payload: ExpenseIn, user: dict = Depends(auth)):
     if payload.amount <= 0:
         raise HTTPException(400, "amount must be positive")
+    if payload.category not in EXPENSE_CATEGORIES:
+        raise HTTPException(400, "Invalid category")
 
     note = ""
     if payload.category == "Subscriptions":
         group = (payload.sub_group or "").strip()
         name  = (payload.sub_name  or "").strip()
+        if group and group not in SUB_GROUPS:
+            raise HTTPException(400, "Invalid subscription group")
         if group and name:
             note = f"{group} | {name}"
         elif name:
@@ -639,6 +735,8 @@ async def api_expense_add(payload: ExpenseIn, user: dict = Depends(auth)):
 async def api_income_add(payload: IncomeIn, user: dict = Depends(auth)):
     if payload.amount <= 0:
         raise HTTPException(400, "amount must be positive")
+    if payload.source not in INCOME_SOURCES:
+        raise HTTPException(400, "Invalid source")
     def _save():
         ws = get_sheet().worksheet(SHEET_INCOME)
         ws.append_row([datetime.now().strftime("%Y-%m-%d"), payload.source, payload.amount, ""])
@@ -859,20 +957,29 @@ def _chart_inc_exp(book):
 
     import numpy as np
     labels   = [datetime.strptime(m, "%Y-%m").strftime("%b %y") for m in months]
-    incomes  = [income_by_m[m]  for m in months]
-    expenses = [expense_by_m[m] for m in months]
+    incomes  = np.array([income_by_m[m]  for m in months], dtype=float)
+    expenses = np.array([expense_by_m[m] for m in months], dtype=float)
     x = np.arange(len(labels))
-    w = 0.38
 
     fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.bar(x - w/2, incomes,  w, label="Income",   color="#2DAE85")
-    ax.bar(x + w/2, expenses, w, label="Expenses", color="#E74C3C")
+
+    # Shade the gap: green where income ≥ expenses (savings), red where income < expenses (deficit)
+    ax.fill_between(x, incomes, expenses, where=(incomes >= expenses),
+                    interpolate=True, color="#2DAE85", alpha=0.22, label="Savings")
+    ax.fill_between(x, incomes, expenses, where=(incomes <  expenses),
+                    interpolate=True, color="#E74C3C", alpha=0.22, label="Deficit")
+
+    # Lines on top of the shading
+    ax.plot(x, incomes,  marker="o", color="#2DAE85", linewidth=2.5, label="Income")
+    ax.plot(x, expenses, marker="o", color="#E74C3C", linewidth=2.5, label="Expenses")
+
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_title("Income vs Expenses — last 6 months", fontsize=14, fontweight="bold")
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"₸{int(v):,}"))
+    ax.set_ylim(bottom=0)  # zero-baseline so the shaded gap is meaningful
     _style_ax(ax)
-    legend = ax.legend()
+    legend = ax.legend(loc="upper left", fontsize=9)
     legend.get_frame().set_facecolor("#17212B")
     for t in legend.get_texts(): t.set_color("#E1E8ED")
     return _fig_png(fig)
