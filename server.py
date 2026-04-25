@@ -13,16 +13,18 @@ import hmac
 import hashlib
 import logging
 import asyncio
+import secrets
+import time
 from urllib.parse import parse_qs, unquote
 from datetime import datetime
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, Response, Cookie
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 
 import gspread
 
@@ -43,14 +45,51 @@ logger = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "")   # without @, for the Login Widget
 SHEET_ID    = os.environ.get("SHEET_ID", "")
 CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 EF_TARGET   = int(os.environ.get("EF_TARGET", "2988000"))
-WEBAPP_URL  = os.environ.get("WEBAPP_URL", "")          # e.g. https://your-app.up.railway.app
+WEBAPP_URL  = os.environ.get("WEBAPP_URL", "")
 ALLOWED_USER_IDS = [
     int(x.strip()) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()
-]  # comma-separated Telegram user IDs; empty = allow anyone who has the URL (dev only)
+]
 PORT = int(os.environ.get("PORT", "8080"))
+
+# ── Session store (in-memory; sessions expire on server restart) ─────────────
+# For a single-user app this is fine. For multi-user, use Redis.
+SESSIONS: dict[str, dict] = {}   # session_id -> {user_id, first_name, expires_at}
+SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+SESSION_COOKIE_NAME = "finance_session"
+
+# ── Rate limiter (per IP, sliding window) ─────────────────────────────────────
+# Key: (bucket_name, ip)   →   list of recent request timestamps
+_RATE_LIMIT: dict[tuple[str, str], list[float]] = {}
+_RATE_LIMITS = {
+    "login":   (10, 60),    # 10 login attempts per minute
+    "write":   (60, 60),    # 60 writes per minute
+    "read":    (300, 60),   # 300 reads per minute
+}
+
+
+def _check_rate_limit(bucket: str, ip: str) -> None:
+    limit, window = _RATE_LIMITS.get(bucket, (100, 60))
+    now = time.time()
+    key = (bucket, ip)
+    timestamps = _RATE_LIMIT.get(key, [])
+    # Drop expired timestamps
+    timestamps = [t for t in timestamps if now - t < window]
+    if len(timestamps) >= limit:
+        raise HTTPException(status_code=429, detail="Too many requests — slow down")
+    timestamps.append(now)
+    _RATE_LIMIT[key] = timestamps
+
+
+def _client_ip(request: Request) -> str:
+    # Railway sits behind a proxy; trust X-Forwarded-For first IP
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 if not all([BOT_TOKEN, SHEET_ID, CREDENTIALS]):
     raise RuntimeError("Missing required env vars: BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS")
@@ -91,7 +130,7 @@ def ensure_sheets(book):
 def cell_int(val) -> int:
     try:
         return int(str(val).replace(",", "").replace("₸", "").strip() or 0)
-    except:
+    except (ValueError, TypeError):
         return 0
 
 
@@ -129,26 +168,86 @@ def verify_init_data(init_data: str) -> dict:
     if not hmac.compare_digest(expected_hash, received_hash):
         raise HTTPException(status_code=401, detail="Invalid initData signature")
 
+    # Reject stale initData (> 24h old) to prevent replay attacks
+    try:
+        auth_date = int(parsed.get("auth_date", "0"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid auth_date")
+
+    if auth_date == 0 or time.time() - auth_date > 86400:
+        raise HTTPException(status_code=401, detail="initData expired — reopen the app")
+
     # Parse user field (JSON)
     user_field = unquote(parsed.get("user", "{}"))
     try:
         user = json.loads(user_field)
-    except:
+    except json.JSONDecodeError:
         user = {}
 
-    return {"user": user, "auth_date": parsed.get("auth_date")}
+    return {"user": user, "auth_date": auth_date}
 
 
 async def auth(request: Request) -> dict:
+    # Rate limit all authenticated requests per IP (generous)
+    ip = _client_ip(request)
+    # Use 'write' bucket for POST, 'read' for others — cheaper on reads
+    bucket = "write" if request.method == "POST" else "read"
+    _check_rate_limit(bucket, ip)
+
+    # Option 1: Telegram Mini App — verify initData
     init_data = request.headers.get("X-Telegram-Init-Data", "")
-    data = verify_init_data(init_data)
-    user = data.get("user", {})
-    user_id = user.get("id")
+    if init_data:
+        data = verify_init_data(init_data)
+        user = data.get("user", {})
+        user_id = user.get("id")
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            raise HTTPException(status_code=403, detail="User not allowed")
+        return user
 
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
-        raise HTTPException(status_code=403, detail="User not allowed")
+    # Option 2: Browser session cookie
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_id and session_id in SESSIONS:
+        sess = SESSIONS[session_id]
+        if sess["expires_at"] > time.time():
+            if ALLOWED_USER_IDS and sess["user_id"] not in ALLOWED_USER_IDS:
+                raise HTTPException(status_code=403, detail="User not allowed")
+            return {"id": sess["user_id"], "first_name": sess.get("first_name", "")}
+        else:
+            SESSIONS.pop(session_id, None)
 
-    return user
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+# ── Telegram Login Widget verification ───────────────────────────────────────
+# Docs: https://core.telegram.org/widgets/login#checking-authorization
+def verify_login_widget(data: dict) -> dict:
+    """Validate a Telegram Login Widget payload."""
+    received_hash = data.pop("hash", "")
+    if not received_hash:
+        raise HTTPException(status_code=401, detail="Missing hash")
+
+    # Build data_check_string: key=value sorted alphabetically, joined by newline
+    data_check_string = "\n".join(
+        f"{k}={data[k]}" for k in sorted(data.keys())
+    )
+
+    # secret_key = SHA256(BOT_TOKEN)
+    secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(expected_hash, received_hash):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # Check auth_date freshness (reject if older than 1 day)
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid auth_date")
+
+    if time.time() - auth_date > 86400:
+        raise HTTPException(status_code=401, detail="Login data too old — please log in again")
+
+    return data
 
 
 # ── Run blocking gspread calls in a thread pool ──────────────────────────────
@@ -160,36 +259,36 @@ async def run_sync(func, *args, **kwargs):
 # API Models
 # ────────────────────────────────────────────────────────────────────────────
 class EmergencyFundIn(BaseModel):
-    amount: int
+    amount: int = Field(gt=0, le=1_000_000_000)
 
 class ExpenseIn(BaseModel):
-    category: str
-    amount: int
-    sub_group: str | None = None   # only used when category == "Subscriptions"
-    sub_name:  str | None = None
+    category: str = Field(min_length=1, max_length=50)
+    amount:   int = Field(gt=0, le=1_000_000_000)
+    sub_group: str | None = Field(default=None, max_length=50)
+    sub_name:  str | None = Field(default=None, max_length=100)
 
 class IncomeIn(BaseModel):
-    source: str
-    amount: int
+    source: str = Field(min_length=1, max_length=50)
+    amount: int = Field(gt=0, le=1_000_000_000)
 
 class InvestmentIn(BaseModel):
-    wallet: str
-    asset: str
-    value: int
+    wallet: str = Field(min_length=1, max_length=80)
+    asset:  str = Field(min_length=1, max_length=80)
+    value:  int = Field(gt=0, le=1_000_000_000)
 
 class AccountIn(BaseModel):
-    account: str
-    balance: int
+    account: str = Field(min_length=1, max_length=80)
+    balance: int = Field(gt=0, le=1_000_000_000)
 
 class EditIn(BaseModel):
-    kind: str      # "ef" | "exp" | "inc" | "inv" | "acc"
-    row: int       # 1-based sheet row number
-    new_amount: int
+    kind:       str = Field(min_length=1, max_length=10)
+    row:        int = Field(ge=2, le=10000)
+    new_amount: int = Field(gt=0, le=1_000_000_000)
 
 
 class DeleteIn(BaseModel):
-    kind: str
-    row: int
+    kind: str = Field(min_length=1, max_length=10)
+    row:  int = Field(ge=2, le=10000)
 
 EDIT_SHEETS = {
     "ef":  (SHEET_EF,       1),  # amount col is index 1 (0-based) → column B
@@ -248,13 +347,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# CORS — permissive for Telegram webview
+# CORS — restrict to the app's own origin. Telegram Mini App runs on same origin.
+_allowed_origins = []
+if WEBAPP_URL:
+    _allowed_origins.append(WEBAPP_URL.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins or ["http://localhost:8080"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-Telegram-Init-Data"],
 )
 
 
@@ -284,12 +387,89 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/")
-async def root():
+async def root(request: Request):
+    # If this is a Telegram Mini App (initData is added client-side via JS),
+    # serve the app and let JS handle auth.
+    # If a browser without session, redirect to /login.
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    has_session = session_id and session_id in SESSIONS and SESSIONS[session_id]["expires_at"] > time.time()
+
+    # Telegram Mini App sends a Telegram-WebApp-Init-Data hint in referrer/navigator,
+    # but the simplest signal is whether the URL contains "#tgWebAppData" (Telegram appends this).
+    # The HTML itself works both ways — serving index.html always is fine because
+    # the app JS checks for initData and redirects to /login if missing and no session.
     return FileResponse("static/index.html")
+
+
+@app.get("/login")
+async def login_page():
+    return FileResponse("static/login.html")
 
 
 @app.get("/healthz")
 async def healthz():
+    return {"ok": True}
+
+
+# ── Public config (unauthenticated) — tells the login page which bot to use ──
+@app.get("/api/config")
+async def api_config():
+    return {"bot_username": BOT_USERNAME}
+
+
+# ── Telegram Login Widget callback — browsers only ───────────────────────────
+class LoginPayload(BaseModel):
+    id: int = Field(gt=0)
+    first_name: str | None = Field(default=None, max_length=100)
+    last_name:  str | None = Field(default=None, max_length=100)
+    username:   str | None = Field(default=None, max_length=50)
+    photo_url:  str | None = Field(default=None, max_length=500)
+    auth_date:  int
+    hash:       str = Field(min_length=64, max_length=64)
+
+
+@app.post("/api/auth/login")
+async def api_login(payload: LoginPayload, request: Request, response: Response):
+    _check_rate_limit("login", _client_ip(request))
+
+    # Rebuild dict for verification
+    data = payload.model_dump(exclude_none=True)
+    data_str = {k: str(v) for k, v in data.items()}
+    verify_login_widget(data_str)
+
+    user_id = payload.id
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        raise HTTPException(status_code=403, detail="User not allowed")
+
+    # Issue a new session
+    session_id = secrets.token_urlsafe(32)
+    SESSIONS[session_id] = {
+        "user_id":    user_id,
+        "first_name": payload.first_name or "",
+        "expires_at": time.time() + SESSION_TTL_SECONDS,
+    }
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return {"ok": True, "user": {"id": user_id, "first_name": payload.first_name}}
+
+
+@app.post("/api/auth/logout")
+async def api_logout(response: Response, session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
+    if session:
+        SESSIONS.pop(session, None)
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
     return {"ok": True}
 
 
@@ -317,7 +497,8 @@ async def api_summary(user: dict = Depends(auth)):
                 if len(r) >= 3 and r[0].startswith(month):
                     income_rows_month.append(r)
                     income_total += cell_int(r[2])
-        except: pass
+        except Exception as e:
+            logger.warning(f"Summary income read failed: {e}")
 
         # Expenses
         expense_total = 0
@@ -339,14 +520,16 @@ async def api_summary(user: dict = Depends(auth)):
                         group, name = _parse_sub_note(note)
                         subs_by_group[group] += amt
                         subs_by_name[name]   += amt
-        except: pass
+        except Exception as e:
+            logger.warning(f"Summary expense read failed: {e}")
 
         # EF
         ef_total = 0
         try:
             ws = book.worksheet(SHEET_EF)
             ef_total = sum(cell_int(r[1]) for r in ws.get_all_values()[1:] if len(r) > 1)
-        except: pass
+        except Exception as e:
+            logger.warning(f"Summary EF read failed: {e}")
 
         # Accounts — latest balance per account
         accounts = {}
@@ -355,7 +538,8 @@ async def api_summary(user: dict = Depends(auth)):
             for r in ws.get_all_values()[1:]:
                 if len(r) >= 3 and r[0]:
                     accounts[r[1]] = cell_int(r[2])
-        except: pass
+        except Exception as e:
+            logger.warning(f"Summary accounts read failed: {e}")
         accounts_total = sum(accounts.values())
 
         # Investments — latest per (wallet, asset)
@@ -365,7 +549,8 @@ async def api_summary(user: dict = Depends(auth)):
             for r in ws.get_all_values()[1:]:
                 if len(r) >= 4 and r[0]:
                     inv[f"{r[2]} ({r[1]})"] = cell_int(r[3])
-        except: pass
+        except Exception as e:
+            logger.warning(f"Summary investments read failed: {e}")
         inv_total = sum(inv.values())
 
         return {
@@ -497,10 +682,15 @@ async def api_edit(payload: EditIn, user: dict = Depends(auth)):
         raise HTTPException(400, "unknown kind")
     if payload.new_amount <= 0:
         raise HTTPException(400, "amount must be positive")
+    if payload.row < 2:
+        raise HTTPException(400, "row must be ≥ 2 (row 1 is the header)")
 
     def _save():
         sheet_name, amt_col_idx = EDIT_SHEETS[payload.kind]
         ws = get_sheet().worksheet(sheet_name)
+        # Validate row exists
+        if payload.row > ws.row_count:
+            raise HTTPException(400, "row out of range")
         ws.update_cell(payload.row, amt_col_idx + 1, payload.new_amount)
         if payload.kind == "ef":
             _rebuild_ef_running(ws)
@@ -512,10 +702,14 @@ async def api_edit(payload: EditIn, user: dict = Depends(auth)):
 async def api_delete(payload: DeleteIn, user: dict = Depends(auth)):
     if payload.kind not in EDIT_SHEETS:
         raise HTTPException(400, "unknown kind")
+    if payload.row < 2:
+        raise HTTPException(400, "row must be ≥ 2 (cannot delete the header)")
 
     def _save():
         sheet_name, _ = EDIT_SHEETS[payload.kind]
         ws = get_sheet().worksheet(sheet_name)
+        if payload.row > ws.row_count:
+            raise HTTPException(400, "row out of range")
         ws.delete_rows(payload.row)
         if payload.kind == "ef":
             _rebuild_ef_running(ws)
@@ -590,7 +784,7 @@ def _chart_ef(book):
     for r in rows:
         try:
             d = datetime.strptime(r[0], "%Y-%m-%d")
-        except:
+        except ValueError:
             continue
         running += cell_int(r[1])
         dates.append(d); totals.append(running)
@@ -651,14 +845,14 @@ def _chart_inc_exp(book):
                 mkey = r[0][:7]
                 if mkey in income_by_m:
                     income_by_m[mkey] += cell_int(r[2])
-    except: pass
+    except Exception: pass
     try:
         for r in book.worksheet(SHEET_BUDGET).get_all_values()[1:]:
             if len(r) >= 3 and r[0]:
                 mkey = r[0][:7]
                 if mkey in expense_by_m:
                     expense_by_m[mkey] += cell_int(r[2])
-    except: pass
+    except Exception: pass
 
     if not any(income_by_m.values()) and not any(expense_by_m.values()):
         return None
@@ -693,7 +887,7 @@ def _chart_accounts(book):
     for r in rows:
         try:
             d = datetime.strptime(r[0], "%Y-%m-%d")
-        except:
+        except ValueError:
             continue
         series[r[1]].append((d, cell_int(r[2])))
     if not series: return None
@@ -724,7 +918,7 @@ def _chart_investments(book):
     for r in rows:
         try:
             d = datetime.strptime(r[0], "%Y-%m-%d")
-        except:
+        except ValueError:
             continue
         series[f"{r[2]} ({r[1]})"].append((d, cell_int(r[3])))
     if not series: return None
