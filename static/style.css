@@ -284,6 +284,7 @@ h2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--space-3);
+  margin-bottom: var(--space-3);
 }
 .grid-2 .card {
   margin-bottom: 0;
