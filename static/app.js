@@ -110,42 +110,45 @@ async function loadSummary() {
   try {
     const s = await api("/api/summary");
 
-    document.getElementById("s-month").textContent = s.month;
+    document.getElementById("s-month-label").textContent = s.month;
     document.getElementById("s-networth").textContent = fmt(s.net_worth);
     document.getElementById("s-income").textContent = fmt(s.income_month);
     document.getElementById("s-expense").textContent = fmt(s.expense_month);
 
     const netEl = document.getElementById("s-net");
-    netEl.textContent = (s.net_month >= 0 ? "🟢 " : "🔴 ") + fmt(s.net_month);
+    netEl.textContent = fmt(s.net_month);
+    netEl.classList.toggle("positive", s.net_month >= 0);
+    netEl.classList.toggle("negative", s.net_month < 0);
 
-    document.getElementById("s-ef-total").textContent = `${fmt(s.ef_total)} / ${fmt(s.ef_target)}`;
+    document.getElementById("s-ef-total").textContent = fmt(s.ef_total);
     document.getElementById("s-ef-pct").textContent = s.ef_pct + "%";
     document.getElementById("s-ef-bar").style.width = s.ef_pct + "%";
+    document.getElementById("s-ef-target-inline").textContent = fmt(s.ef_target);
 
     document.getElementById("s-accounts-total").textContent = fmt(s.accounts_total);
     const accUl = document.getElementById("s-accounts");
     accUl.innerHTML = Object.entries(s.accounts)
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `<li><span class="name">${esc(k)}</span><span class="num">${fmt(v)}</span></li>`)
-      .join("") || '<li class="muted">No data</li>';
+      .join("") || '<li class="muted">No snapshots yet</li>';
 
     document.getElementById("s-inv-total").textContent = fmt(s.investments_total);
     const invUl = document.getElementById("s-inv");
     invUl.innerHTML = Object.entries(s.investments)
       .sort((a, b) => b[1] - a[1])
       .map(([k, v]) => `<li><span class="name">${esc(k)}</span><span class="num">${fmt(v)}</span></li>`)
-      .join("") || '<li class="muted">No data</li>';
+      .join("") || '<li class="muted">No snapshots yet</li>';
 
     const expUl = document.getElementById("s-exp-cats");
     const expEntries = Object.entries(s.expenses_by_category).slice(0, 5);
     expUl.innerHTML = expEntries.length
       ? expEntries.map(([k, v]) => `<li><span class="name">${esc(k)}</span><span class="num">${fmt(v)}</span></li>`).join("")
-      : '<li class="muted">No expenses this month</li>';
+      : '<li class="muted">No expenses yet</li>';
 
     // Subscriptions breakdown
-    const subsCard = document.getElementById("s-subs-card");
+    const subsWrap = document.getElementById("s-subs-wrap");
     if (s.subs_total > 0) {
-      subsCard.classList.remove("hidden");
+      subsWrap.classList.remove("hidden");
       document.getElementById("s-subs-total").textContent = fmt(s.subs_total);
       document.getElementById("s-subs-groups").innerHTML =
         Object.entries(s.subs_by_group)
@@ -156,13 +159,13 @@ async function loadSummary() {
           .map(([k, v]) => `<li><span class="name">${esc(k)}</span><span class="num">${fmt(v)}</span></li>`)
           .join("");
     } else {
-      subsCard.classList.add("hidden");
+      subsWrap.classList.add("hidden");
     }
 
     loading.classList.add("hidden");
     content.classList.remove("hidden");
   } catch (e) {
-    loading.innerHTML = `<div style="color:#E74C3C">Error loading summary: ${e.message}</div>`;
+    loading.innerHTML = `<div style="color: var(--danger)">Error loading summary: ${e.message}</div>`;
   }
 }
 

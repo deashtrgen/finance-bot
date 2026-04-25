@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in — Finance</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .login-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 40px 32px;
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+    }
+    .login-icon {
+      font-size: 56px;
+      margin-bottom: 16px;
+    }
+    .login-title {
+      font-size: 22px;
+      font-weight: 600;
+      margin: 0 0 8px 0;
+    }
+    .login-subtitle {
+      color: var(--text-muted);
+      margin: 0 0 32px 0;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #tg-login-container {
+      display: flex;
+      justify-content: center;
+      margin: 20px 0;
+      min-height: 50px;
+    }
+    .login-footer {
+      margin-top: 28px;
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    .login-footer a { color: var(--accent); text-decoration: none; }
+    .error-msg {
+      color: var(--danger);
+      background: rgba(231, 76, 60, 0.12);
+      border: 1px solid rgba(231, 76, 60, 0.3);
+      padding: 10px;
+      border-radius: var(--radius-sm);
+      margin-top: 16px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="login-card">
+  <div class="login-icon">💼</div>
+  <h1 class="login-title">Finance App</h1>
+  <p class="login-subtitle">
+    Sign in with Telegram to access your personal finance dashboard.
+  </p>
+
+  <div id="tg-login-container">
+    <div class="muted">Loading…</div>
+  </div>
+
+  <div id="error" class="error-msg" style="display:none"></div>
+
+  <div class="login-footer">
+    🔒 We use Telegram's official login.<br>
+    No passwords, no email — just a signed handshake.
+  </div>
+</div>
+
+<script>
+  // Fetch bot username from server, then render the Telegram login widget
+  (async () => {
+    const container = document.getElementById("tg-login-container");
+    const errorBox  = document.getElementById("error");
+
+    try {
+      const res = await fetch("/api/config", { credentials: "same-origin" });
+      const cfg = await res.json();
+      if (!cfg.bot_username) {
+        throw new Error("Bot username not configured on server (BOT_USERNAME env var missing).");
+      }
+
+      // Register the callback globally so the widget can find it
+      window.onTelegramAuth = async (user) => {
+        try {
+          const r = await fetch("/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(user),
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({ detail: "Login failed" }));
+            throw new Error(err.detail || "Login failed");
+          }
+          // Redirect to the main app
+          window.location.href = "/";
+        } catch (e) {
+          errorBox.textContent = e.message;
+          errorBox.style.display = "block";
+        }
+      };
+
+      // Inject the Telegram login widget script
+      const script = document.createElement("script");
+      script.async = true;
+      script.src = "https://telegram.org/js/telegram-widget.js?22";
+      script.setAttribute("data-telegram-login", cfg.bot_username);
+      script.setAttribute("data-size", "large");
+      script.setAttribute("data-onauth", "onTelegramAuth(user)");
+      script.setAttribute("data-request-access", "write");
+      script.setAttribute("data-userpic", "false");
+
+      container.innerHTML = "";
+      container.appendChild(script);
+    } catch (e) {
+      container.innerHTML = "";
+      errorBox.textContent = "Could not load login widget: " + e.message;
+      errorBox.style.display = "block";
+    }
+  })();
+</script>
+
+</body>
+</html>

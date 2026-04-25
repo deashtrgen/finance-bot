@@ -35,58 +35,85 @@
   <section id="panel-home" class="panel active">
     <div id="summary-loading" class="muted center">Loading…</div>
     <div id="summary-content" class="hidden">
-      <div class="card card-accent">
-        <div class="row"><span>Net Worth</span><strong id="s-networth">—</strong></div>
+
+      <!-- Hero: net worth -->
+      <div class="hero-card">
+        <div class="hero-label">Net Worth</div>
+        <div class="hero-value" id="s-networth">—</div>
       </div>
 
+      <!-- This month stats -->
+      <div class="section-label" id="s-month-label">This month</div>
       <div class="grid-2">
         <div class="card">
-          <div class="label">Income — <span id="s-month">this month</span></div>
-          <div class="value" id="s-income">—</div>
+          <div class="label">Income</div>
+          <div class="value positive" id="s-income">—</div>
         </div>
         <div class="card">
-          <div class="label">Expenses — this month</div>
+          <div class="label">Expenses</div>
           <div class="value" id="s-expense">—</div>
         </div>
       </div>
 
       <div class="card">
-        <div class="row"><span>Net this month</span><strong id="s-net">—</strong></div>
+        <div class="row">
+          <span class="muted">Net this month</span>
+          <strong id="s-net" class="value small">—</strong>
+        </div>
       </div>
 
+      <!-- Emergency Fund -->
+      <div class="section-label">💰 Emergency Fund</div>
       <div class="card">
-        <div class="label">💰 Emergency Fund</div>
+        <div class="row">
+          <span id="s-ef-total" class="value small">—</span>
+          <span id="s-ef-pct" class="muted">—</span>
+        </div>
         <div class="progress"><div class="progress-bar" id="s-ef-bar"></div></div>
-        <div class="row subtle"><span id="s-ef-total">—</span><span id="s-ef-pct">—</span></div>
+        <div class="muted" style="font-size: var(--text-sm);">Target: <span id="s-ef-target-inline">—</span></div>
       </div>
 
+      <!-- Accounts -->
+      <div class="section-label">💳 Bank Accounts</div>
       <div class="card">
-        <div class="label">💳 Bank Accounts</div>
-        <div class="value small" id="s-accounts-total">—</div>
-        <ul class="list" id="s-accounts"></ul>
+        <div class="row">
+          <span class="muted">Total balance</span>
+          <strong id="s-accounts-total" class="value small">—</strong>
+        </div>
+        <ul class="list" id="s-accounts" style="margin-top: var(--space-3);"></ul>
       </div>
 
+      <!-- Investments -->
+      <div class="section-label">📈 Investments</div>
       <div class="card">
-        <div class="label">📈 Investments (latest)</div>
-        <div class="value small" id="s-inv-total">—</div>
-        <ul class="list" id="s-inv"></ul>
+        <div class="row">
+          <span class="muted">Latest value</span>
+          <strong id="s-inv-total" class="value small">—</strong>
+        </div>
+        <ul class="list" id="s-inv" style="margin-top: var(--space-3);"></ul>
       </div>
 
+      <!-- Top spending -->
+      <div class="section-label">📊 Top spending</div>
       <div class="card">
-        <div class="label">📊 Top spending categories this month</div>
         <ul class="list" id="s-exp-cats"></ul>
       </div>
 
-      <div class="card hidden" id="s-subs-card">
-        <div class="row">
-          <div class="label" style="margin-bottom:0">📺 Subscriptions this month</div>
-          <strong id="s-subs-total">—</strong>
+      <!-- Subscriptions (conditionally visible) -->
+      <div class="hidden" id="s-subs-wrap">
+        <div class="section-label">📺 Subscriptions</div>
+        <div class="card" id="s-subs-card">
+          <div class="row">
+            <span class="muted">Monthly total</span>
+            <strong id="s-subs-total" class="value small">—</strong>
+          </div>
+          <div class="label" style="margin-top: var(--space-4);">By group</div>
+          <ul class="list" id="s-subs-groups"></ul>
+          <div class="label" style="margin-top: var(--space-4);">By subscription</div>
+          <ul class="list" id="s-subs-names"></ul>
         </div>
-        <div class="label" style="margin-top:10px">By group</div>
-        <ul class="list" id="s-subs-groups"></ul>
-        <div class="label" style="margin-top:10px">By subscription</div>
-        <ul class="list" id="s-subs-names"></ul>
       </div>
+
     </div>
   </section>
 
