@@ -125,20 +125,41 @@ body {
 /* ══════════════════════════════════════════════════════════════════════
    TABS
    ══════════════════════════════════════════════════════════════════════ */
+#tabs-wrap {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: 15;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
 #tabs {
   display: flex;
   gap: var(--space-2);
   padding: var(--space-3) var(--space-4);
-  background: var(--bg);
   overflow-x: auto;
-  border-bottom: 1px solid var(--border-subtle);
-  position: sticky;
-  top: var(--topbar-h);
-  z-index: 15;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
+  cursor: grab;
+  user-select: none;
 }
+#tabs.dragging { cursor: grabbing; }
 #tabs::-webkit-scrollbar { display: none; }
+
+/* Subtle fade on the right edge to hint that more tabs are scrollable */
+#tabs-wrap::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 32px;
+  height: 100%;
+  background: linear-gradient(to left, var(--bg), transparent);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#tabs-wrap.has-overflow-right::after { opacity: 1; }
 
 .tab {
   flex-shrink: 0;

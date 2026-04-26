@@ -67,6 +67,72 @@ document.querySelectorAll(".tab").forEach((btn) => {
   });
 });
 
+// ── Tabs: drag-to-scroll + wheel-to-scroll horizontally ──────────
+(function setupTabsScroll() {
+  const tabs = document.getElementById("tabs");
+  const wrap = document.getElementById("tabs-wrap");
+  if (!tabs || !wrap) return;
+
+  // Mouse-wheel: convert vertical wheel into horizontal scroll over tabs
+  tabs.addEventListener("wheel", (e) => {
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    tabs.scrollLeft += e.deltaY;
+  }, { passive: false });
+
+  // Click-and-drag scrolling
+  let isDown = false;
+  let startX = 0;
+  let scrollStart = 0;
+  let dragMoved = false;
+
+  tabs.addEventListener("mousedown", (e) => {
+    isDown = true;
+    dragMoved = false;
+    startX = e.pageX - tabs.offsetLeft;
+    scrollStart = tabs.scrollLeft;
+    tabs.classList.add("dragging");
+  });
+
+  // If the user drags > 5px, treat it as a scroll (suppress click on the underlying tab)
+  tabs.addEventListener("mousemove", (e) => {
+    if (!isDown) return;
+    e.preventDefault();
+    const x = e.pageX - tabs.offsetLeft;
+    const dx = x - startX;
+    if (Math.abs(dx) > 5) dragMoved = true;
+    tabs.scrollLeft = scrollStart - dx;
+  });
+
+  const stopDrag = () => {
+    isDown = false;
+    tabs.classList.remove("dragging");
+  };
+  tabs.addEventListener("mouseup", stopDrag);
+  tabs.addEventListener("mouseleave", stopDrag);
+
+  // Suppress click if drag moved more than the threshold
+  tabs.addEventListener("click", (e) => {
+    if (dragMoved) {
+      e.preventDefault();
+      e.stopPropagation();
+      dragMoved = false;
+    }
+  }, true);
+
+  // Update right-edge fade indicator based on scroll position
+  function updateFade() {
+    const maxScroll = tabs.scrollWidth - tabs.clientWidth;
+    const hasMoreRight = maxScroll > 0 && tabs.scrollLeft < maxScroll - 4;
+    wrap.classList.toggle("has-overflow-right", hasMoreRight);
+  }
+  tabs.addEventListener("scroll", updateFade);
+  window.addEventListener("resize", updateFade);
+  // Initial check after layout settles
+  setTimeout(updateFade, 50);
+  setTimeout(updateFade, 300);
+})();
+
 // ── Initial load ───────────────────────────────────────────────
 let EF_TARGET = 2988000;
 
@@ -84,9 +150,15 @@ let EF_TARGET = 2988000;
       window.location.href = "/login";
       return;
     }
-    document.getElementById("summary-loading").innerHTML =
-      '<div style="color:#E74C3C">Auth failed. Try closing and reopening the app.</div>' +
-      `<div class="muted" style="margin-top:10px">${e.message}</div>`;
+    document.getElementById("summary-loading").innerHTML = "";
+    const errMain = document.createElement("div");
+    errMain.style.color = "var(--danger)";
+    errMain.textContent = "Auth failed. Try closing and reopening the app.";
+    const errDetail = document.createElement("div");
+    errDetail.className = "muted";
+    errDetail.style.marginTop = "10px";
+    errDetail.textContent = e.message;
+    document.getElementById("summary-loading").append(errMain, errDetail);
   }
 })();
 
@@ -165,7 +237,11 @@ async function loadSummary() {
     loading.classList.add("hidden");
     content.classList.remove("hidden");
   } catch (e) {
-    loading.innerHTML = `<div style="color: var(--danger)">Error loading summary: ${e.message}</div>`;
+    loading.innerHTML = "";
+    const div = document.createElement("div");
+    div.style.color = "var(--danger)";
+    div.textContent = `Error loading summary: ${e.message}`;
+    loading.appendChild(div);
   }
 }
 
@@ -314,9 +390,18 @@ async function loadChart(kind) {
     }
     const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
-    wrap.innerHTML = `<img src="${url}" alt="chart" />`;
+    wrap.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "chart";
+    wrap.appendChild(img);
   } catch (e) {
-    wrap.innerHTML = `<div style="color:#E74C3C" class="center">${e.message}</div>`;
+    wrap.innerHTML = "";
+    const div = document.createElement("div");
+    div.className = "center";
+    div.style.color = "var(--danger)";
+    div.textContent = e.message;
+    wrap.appendChild(div);
   }
 }
 
@@ -337,19 +422,27 @@ async function loadEntries() {
     }
     list.innerHTML = entries.map((e) => renderEntry(kind, e)).join("");
   } catch (err) {
-    list.innerHTML = `<div style="color:#E74C3C" class="center">${err.message}</div>`;
+    list.innerHTML = "";
+    const errDiv = document.createElement("div");
+    errDiv.className = "center";
+    errDiv.style.color = "var(--danger)";
+    errDiv.textContent = err.message;  // textContent safely escapes
+    list.appendChild(errDiv);
   }
 }
 
 function renderEntry(kind, e) {
   const v = e.values;
+  // Escape every value — they all come from Google Sheets and could contain anything
+  const date = esc(v[0] || "");
   let label = "";
-  if (kind === "ef")       label = `${v[0]||""} — ${fmt(v[1]||0)}`;
-  else if (kind === "exp") label = `${v[0]||""} — ${esc(v[1]||"?")}: ${fmt(v[2]||0)}`;
-  else if (kind === "inc") label = `${v[0]||""} — ${esc(v[1]||"?")}: ${fmt(v[2]||0)}`;
-  else if (kind === "acc") label = `${v[0]||""} — ${esc(v[1]||"?")}: ${fmt(v[2]||0)}`;
-  else if (kind === "inv") label = `${v[0]||""} — ${esc(v[2]||"?")} / ${esc(v[1]||"?")}: ${fmt(v[3]||0)}`;
+  if (kind === "ef")       label = `${date} — ${fmt(v[1] || 0)}`;
+  else if (kind === "exp") label = `${date} — ${esc(v[1] || "?")}: ${fmt(v[2] || 0)}`;
+  else if (kind === "inc") label = `${date} — ${esc(v[1] || "?")}: ${fmt(v[2] || 0)}`;
+  else if (kind === "acc") label = `${date} — ${esc(v[1] || "?")}: ${fmt(v[2] || 0)}`;
+  else if (kind === "inv") label = `${date} — ${esc(v[2] || "?")} / ${esc(v[1] || "?")}: ${fmt(v[3] || 0)}`;
 
+  // kind is from a closed set; row is a server-validated integer — both safe to interpolate
   return `
     <div class="entry" data-row="${e.row}">
       <div class="info">${label}</div>
@@ -377,7 +470,10 @@ async function editEntry(kind, row) {
 }
 
 async function deleteEntry(kind, row) {
-  if (!confirm("Delete this entry? This cannot be undone.")) return;
+  // Find the entry's label so the user knows what they're deleting
+  const entryEl = document.querySelector(`.entry[data-row="${row}"] .info`);
+  const label   = entryEl ? entryEl.textContent : "this entry";
+  if (!confirm(`Delete: ${label}?\n\nThis cannot be undone.`)) return;
   try {
     await api("/api/delete", {
       method: "POST",
